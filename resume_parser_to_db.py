@@ -24,8 +24,6 @@ except ImportError:
     print("Missing 'PyPDF2'. Install with: pip install PyPDF2")
     sys.exit(1)
 
-# Explicit list of files to ignore (absolute, normalized paths),
-# but do NOT include files containing 'PhilHobrlaCL' or 'Cover Letter' (case-insensitive) in their name.
 IGNORE_FILES = {
     '/Users/phobrla/Documents/Career/Application Materials/vollman----interview-notes-unstructured.docx',
     '/Users/phobrla/Documents/Career/Application Materials/Project Manager- IT - Salem, VA 24153 - Indeed.com.pdf',
@@ -49,8 +47,6 @@ IGNORE_FILES = {
     '/Users/phobrla/Documents/Career/Application Materials/Phil Hobrla - References (1).docx',
     '/Users/phobrla/Documents/Career/Application Materials/Phil Hobrla - References.docx',
     '/Users/phobrla/Documents/Career/Application Materials/Workforce Recruitment Program/Phil Vollman - Recommendations.pdf',
-    '/Users/phobrla/Documents/Career/Application Materials/PhilHobrlaCL (1).docx',  # Covered by skip logic, can be removed
-    '/Users/phobrla/Documents/Career/Application Materials/Carilion Clinic/Help Desk Specialist I - May 2019/PhilHobrlaCL (2).docx',  # Covered by skip logic, can be removed
     '/Users/phobrla/Documents/Career/Application Materials/PSRRPT-190322111419-42911.pdf',
     '/Users/phobrla/Documents/Career/Application Materials/Resume for Phil.docx',
     '/Users/phobrla/Documents/Career/Application Materials/Resume_10203452191975339.docx',
@@ -61,12 +57,23 @@ IGNORE_FILES = {
     '/Users/phobrla/Documents/Career/Application Materials/Workforce Recruitment Program/Schedule A Lettter II.pdf',
 }
 
+def normalize_path(path: str) -> str:
+    return os.path.abspath(os.path.normpath(path))
+
+def should_ignore(file_path: str, ignore_files_norm: set) -> bool:
+    abs_path = normalize_path(file_path)
+    basename = os.path.basename(file_path).lower()
+    if abs_path in ignore_files_norm:
+        return True
+    if 'philhobrlacl' in basename or 'cover letter' in basename:
+        return True
+    return False
+
 def extract_text_from_docx(file_path: str) -> str:
     try:
         doc = Document(file_path)
         return "\n".join([para.text for para in doc.paragraphs])
     except Exception:
-        # Fallback to docx2txt
         return docx2txt.process(file_path)
 
 def extract_text_from_pdf(file_path: str) -> str:
@@ -78,10 +85,6 @@ def extract_text_from_pdf(file_path: str) -> str:
     return text
 
 def extract_text_from_doc(file_path: str) -> str:
-    """
-    Attempts to extract text from .doc files by converting to .docx using LibreOffice (if available).
-    Requires LibreOffice CLI (soffice).
-    """
     try:
         import subprocess
         import tempfile
@@ -105,37 +108,91 @@ def extract_text_from_doc(file_path: str) -> str:
         print(f"Failed to extract .doc file '{file_path}': {e}")
         return ""
 
-def normalize_path(path: str) -> str:
-    return os.path.abspath(os.path.normpath(path))
+def parse_resume(text: str) -> Dict[str, Any]:
+    # Robust section parsing using regex and section titles
+    sections = {}
+    current_section = "header"
+    sections[current_section] = []
+    lines = [line.strip() for line in text.splitlines()]
+    section_titles = {
+        "summary": re.compile(r"^(summary|profile|objective)$", re.I),
+        "skills": re.compile(r"^(skills|technical\s+skills|core\s+competencies)$", re.I),
+        "experience": re.compile(r"^(experience|work\s+history|professional\s+experience|employment|career\s+history)$", re.I),
+        "education": re.compile(r"^education$", re.I),
+    }
+    current_section_found = False
 
-def should_ignore(file_path: str, ignore_files_norm: set) -> bool:
-    """
-    Returns True if file should be skipped based on:
-      - Explicit ignore file list (normalized)
-      - Filename contains 'PhilHobrlaCL' or 'Cover Letter' (case-insensitive)
-    """
-    abs_path = normalize_path(file_path)
-    basename = os.path.basename(file_path).lower()
-    if abs_path in ignore_files_norm:
-        return True
-    if 'philhobrlacl' in basename or 'cover letter' in basename:
-        return True
-    return False
+    for line in lines:
+        line_clean = line.strip()
+        found_section = None
+        for name, pat in section_titles.items():
+            if pat.match(line_clean):
+                found_section = name
+                break
+        if found_section:
+            current_section = found_section
+            if current_section not in sections:
+                sections[current_section] = []
+            current_section_found = True
+            continue
+        if not current_section_found and not line_clean:
+            # First blank line after header
+            current_section_found = True
+            continue
+        if current_section_found:
+            sections.setdefault(current_section, []).append(line_clean)
+        else:
+            sections[current_section].append(line_clean)
+
+    # Compose outputs
+    header = "\n".join([l for l in sections.get("header", []) if l])
+    summary = " ".join([l for l in sections.get("summary", []) if l])
+    # Parse experiences
+    employers = []
+    if "experience" in sections:
+        exp_lines = sections["experience"]
+        emp = None
+        for line in exp_lines:
+            if not line:
+                continue
+            # Heuristic: employer header likely in Title Case or ALL CAPS, not a bullet
+            if not line.startswith(("-", "*", "•")) and (line.istitle() or line.isupper()):
+                if emp:
+                    employers.append(emp)
+                emp = {"header": line, "summary": "", "highlights": []}
+            elif emp and (line.startswith("•") or line.startswith("-") or line.startswith("*")):
+                emp["highlights"].append(line)
+            elif emp:
+                if emp["summary"]:
+                    emp["summary"] += " " + line
+                else:
+                    emp["summary"] = line
+        if emp:
+            employers.append(emp)
+    skills = []
+    if "skills" in sections:
+        skill_lines = [l for l in sections["skills"] if l]
+        skills = [{"header": "Skills", "skills": skill_lines}]
+    return {
+        "header": header,
+        "summary": summary,
+        "employers": employers,
+        "skills": skills
+    }
 
 def scan_resumes(folder: str) -> List[Dict[str, Any]]:
     resumes_data = []
-    # Recursively collect all pdf, doc, docx files (case-insensitive)
     file_patterns = ["**/*.docx", "**/*.DOCX", "**/*.doc", "**/*.DOC", "**/*.pdf", "**/*.PDF"]
     files = []
     for pat in file_patterns:
         files.extend(glob.glob(os.path.join(folder, pat), recursive=True))
-    # Normalize ignore file paths for comparison
     ignore_files_norm = {normalize_path(f) for f in IGNORE_FILES}
     for file_path in files:
         if should_ignore(file_path, ignore_files_norm):
             print(f"Skipping ignored file: {file_path}")
             continue
         ext = file_path.lower().split(".")[-1]
+        print(f"Parsing: {file_path}")
         try:
             if ext == "docx":
                 text = extract_text_from_docx(file_path)
@@ -146,7 +203,13 @@ def scan_resumes(folder: str) -> List[Dict[str, Any]]:
             else:
                 print(f"Unsupported file type: {file_path}")
                 continue
+            if not text.strip():
+                print(f"WARNING: No text extracted from {file_path}")
             parsed = parse_resume(text)
+            print(f"  Header: {parsed['header'][:40]}...")
+            print(f"  Summary: {parsed['summary'][:40]}...")
+            print(f"  Employers found: {len(parsed['employers'])}")
+            print(f"  Skills found: {len(parsed['skills'])}")
             resumes_data.append({
                 "filename": os.path.basename(file_path),
                 "filepath": normalize_path(file_path),
@@ -160,122 +223,6 @@ def scan_resumes(folder: str) -> List[Dict[str, Any]]:
             print(f"Failed to extract {file_path}: {e}")
             traceback.print_exc()
     return resumes_data
-
-def parse_resume(text: str) -> Dict[str, Any]:
-    """
-    Parse header, summary at top, each employer (summary+highlights), and skills with headers.
-    This uses simple heuristics for common resume layouts. For best results, use consistently-formatted resumes.
-    """
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    # Header: Assume at the very top (name and contact, usually 1-4 lines)
-    header = []
-    summary = ""
-    employers = []
-    skills = []
-
-    # Identify header (first block before a blank line or a known section)
-    header_lines = []
-    for idx, line in enumerate(lines):
-        if (
-            re.search(r'^(summary|objective|profile|professional|experience|employment|work|skills)', line, re.I)
-            or line == ""
-        ):
-            break
-        header_lines.append(line)
-    header = "\n".join(header_lines)
-
-    # Find summary: lines after header and before first work/employment section
-    summary_lines = []
-    i = len(header_lines)
-    while i < len(lines):
-        line = lines[i]
-        if re.search(r'^(experience|employment|work\s+history|professional\s+experience|career\s+history)', line, re.I):
-            break
-        if re.search(r'^(skills|technical\s+skills|core\s+competencies)', line, re.I):
-            break
-        summary_lines.append(line)
-        i += 1
-    summary = " ".join(summary_lines).strip()
-
-    # Find employers: look for experience sections and parse summaries/highlights
-    employers = []
-    employer_section = False
-    employer = {}
-    highlights = []
-    in_employer = False
-    for j in range(i, len(lines)):
-        line = lines[j]
-        # Start of experience section
-        if re.search(r'^(experience|employment|work\s+history|professional\s+experience|career\s+history)', line, re.I):
-            employer_section = True
-            continue
-        # Start of skills section = end of employer parsing
-        if re.search(r'^(skills|technical\s+skills|core\s+competencies)', line, re.I):
-            if employer:
-                employer["highlights"] = highlights
-                employers.append(employer)
-            break
-
-        # Heuristic: employer header lines often contain company name and role, or are ALL CAPS or Title Case
-        if employer_section and (re.match(r'^[A-Z][A-Za-z0-9&,\.\-\s]+$', line) and not line.endswith(":")):
-            if employer:
-                employer["highlights"] = highlights
-                employers.append(employer)
-                highlights = []
-            employer = {"header": line, "summary": "", "highlights": []}
-            in_employer = True
-            # Next line(s) may be summary or job title/dates
-            continue
-        if in_employer and ('•' in line or re.match(r'^[-*•]\s+', line)):
-            # Highlight/bullet
-            highlights.append(line)
-        elif in_employer and not employer.get("summary"):
-            # First line after employer header that is not a bullet is likely the summary
-            employer["summary"] = line
-        elif in_employer and employer.get("summary"):
-            # More summary lines until first bullet
-            if not ('•' in line or re.match(r'^[-*•]\s+', line)):
-                employer["summary"] += " " + line
-            else:
-                highlights.append(line)
-    if employer and employer not in employers:
-        employer["highlights"] = highlights
-        employers.append(employer)
-
-    # Find skills and headers
-    skills = []
-    skill_section_re = re.compile(r'^(skills|technical\s+skills|core\s+competencies)', re.I)
-    current_header = None
-    skill_lines = []
-    found_skill_section = False
-    for idx, line in enumerate(lines):
-        if skill_section_re.match(line):
-            found_skill_section = True
-            current_header = line
-            continue
-        if found_skill_section:
-            # Section ends with a new section or empty line
-            if re.match(r'^(experience|employment|work\s+history|professional\s+experience|career\s+history|education|certification)', line, re.I):
-                if current_header and skill_lines:
-                    skills.append({"header": current_header, "skills": skill_lines})
-                break
-            # Header within skills
-            if line and not re.search(r'[-•*]', line) and len(line.split()) < 7:
-                if current_header and skill_lines:
-                    skills.append({"header": current_header, "skills": skill_lines})
-                current_header = line
-                skill_lines = []
-            else:
-                skill_lines.append(line)
-    if found_skill_section and current_header and skill_lines:
-        skills.append({"header": current_header, "skills": skill_lines})
-
-    return {
-        "header": header,
-        "summary": summary,
-        "employers": employers,
-        "skills": skills
-    }
 
 def init_db(db_file: str):
     conn = sqlite3.connect(db_file)
@@ -321,7 +268,6 @@ def insert_resume(db_file: str, resume: Dict[str, Any]):
     """, (resume['filename'], resume['filepath'], resume['content'], resume['header'], resume['summary']))
     resume_id = c.lastrowid
 
-    # Insert employers
     for emp in resume.get("employers", []):
         c.execute("""
             INSERT INTO employers (resume_id, employer_header, employer_summary, highlights)
@@ -332,7 +278,6 @@ def insert_resume(db_file: str, resume: Dict[str, Any]):
             emp.get("summary", ""),
             "\n".join(emp.get("highlights", []))
         ))
-    # Insert skills
     for s in resume.get("skills", []):
         c.execute("""
             INSERT INTO skills (resume_id, skill_header, skills)
@@ -346,17 +291,25 @@ def insert_resume(db_file: str, resume: Dict[str, Any]):
     conn.close()
 
 def build_master_database(resume_folder: str, db_file: str):
-    print(f"Initializing database: {db_file}")
-    init_db(db_file)
-    print(f"Recursively scanning resumes in folder: {resume_folder}")
-    resumes = scan_resumes(resume_folder)
-    print(f"Found {len(resumes)} resumes.")
-    for resume in resumes:
-        insert_resume(db_file, resume)
-    print("Master database created/updated successfully.")
+    print(f"Will save DB to: {db_file}")
+    try:
+        # Check write permission to parent folder
+        db_dir = os.path.dirname(db_file)
+        if not os.access(db_dir, os.W_OK):
+            print(f"ERROR: No write permission to folder {db_dir}")
+            sys.exit(1)
+        init_db(db_file)
+        print(f"Recursively scanning resumes in folder: {resume_folder}")
+        resumes = scan_resumes(resume_folder)
+        print(f"Found {len(resumes)} resumes to insert.")
+        for resume in resumes:
+            insert_resume(db_file, resume)
+        print("Master database created/updated successfully.")
+    except Exception as e:
+        print(f"ERROR: Could not create database at {db_file}: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    # Default folder and database file
     resume_folder = '/Users/phobrla/Documents/Career/Application Materials'
     db_file = os.path.join(resume_folder, "master_resumes.db")
     if len(sys.argv) > 1:
@@ -364,6 +317,9 @@ if __name__ == "__main__":
         db_file = os.path.join(resume_folder, "master_resumes.db")
     if len(sys.argv) > 2:
         db_file = sys.argv[2]
+    print(f"Running from: {os.getcwd()}")
+    print(f"Input folder: {resume_folder}")
+    print(f"DB target: {db_file}")
     if not os.path.isdir(resume_folder):
         print(f"Resume folder does not exist: {resume_folder}")
         sys.exit(1)
